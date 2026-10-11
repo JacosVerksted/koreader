@@ -151,6 +151,11 @@ local function showSyncError()
     })
 end
 
+-- Cheap local check (no DNS probe), for automatic syncs that must never start or wait for a connection.
+local function isConnectedNow()
+    return NetworkMgr:isWifiOn() and NetworkMgr:isConnected()
+end
+
 local function validate(entry)
     if not entry then return false end
     if type(entry) == "string" then
@@ -711,10 +716,32 @@ function KOSync:syncToProgress(progress)
     end
 end
 
+function KOSync:queueProgress()
+    local doc_digest = self:getDocumentDigest()
+    if not doc_digest then return end
+    require("KOSyncQueue"):push({
+        document = doc_digest,
+        metadata = self:getMetadata(),
+        progress = self:getLastProgress(),
+        percentage = self:getLastPercent(),
+        device = self.settings.kosync_hostname or Device.model,
+        device_id = self.device_id,
+    })
+end
+
 function KOSync:updateProgress(ensure_networking, interactive, on_suspend)
     if not self.settings.username or not self.settings.userkey then
         if interactive then
             promptLogin()
+        end
+        return
+    end
+
+    -- Automatic syncs don't start a connection attempt (Wi-Fi scan, prompt...): queue the progress for the next reconnect.
+    if not interactive and not isConnectedNow() then
+        self:queueProgress()
+        if on_suspend and NetworkMgr:isWifiOn() and Device:hasWifiManager() then
+            NetworkMgr:disableWifi()
         end
         return
     end
@@ -725,7 +752,7 @@ function KOSync:updateProgress(ensure_networking, interactive, on_suspend)
         return
     end
 
-    if ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:updateProgress(ensure_networking, interactive, on_suspend) end) then
+    if interactive and ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:updateProgress(ensure_networking, interactive, on_suspend) end) then
         return
     end
 
@@ -817,13 +844,18 @@ function KOSync:getProgress(ensure_networking, interactive)
         return
     end
 
+    -- Automatic pulls only run on an already established connection.
+    if not interactive and not isConnectedNow() then
+        return
+    end
+
     local now = UIManager:getElapsedTimeSinceBoot()
     if not interactive and now - self.pull_timestamp <= API_CALL_DEBOUNCE_DELAY then
         logger.dbg("KOSync: We've already pulled progress less than 25s ago!")
         return
     end
 
-    if ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:getProgress(ensure_networking, interactive) end) then
+    if interactive and ensure_networking and NetworkMgr:willRerunWhenOnline(function() self:getProgress(ensure_networking, interactive) end) then
         return
     end
 
@@ -945,24 +977,8 @@ function KOSync:_onCloseDocument()
     --       and we handle those system focus events via... Suspend & Resume events, so we need to neuter those handlers early.
     self.onResume = nil
     self.onSuspend = nil
-    -- If we're already online, push normally.
-    -- Otherwise, queue progress for later instead of blocking with goOnlineToRun.
-    if NetworkMgr:isOnline() then
-        self:updateProgress(false, false)
-    else
-        local doc_digest = self:getDocumentDigest()
-        if doc_digest then
-            local KOSyncQueue = require("KOSyncQueue")
-            KOSyncQueue:push({
-                document = doc_digest,
-                metadata = self:getMetadata(),
-                progress = self:getLastProgress(),
-                percentage = self:getLastPercent(),
-                device = self.settings.kosync_hostname or Device.model,
-                device_id = self.device_id,
-            })
-        end
-    end
+    -- Pushes if we're connected, queues the progress for later otherwise.
+    self:updateProgress(false, false)
 end
 
 function KOSync:schedulePeriodicPush()
